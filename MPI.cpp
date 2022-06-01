@@ -7,7 +7,7 @@ using namespace std;
 typedef long long ll;
 
 #define ROW 1024
-#define INTERVAL 10000\
+#define INTERVAL 10000
 
 //use	mpiexec -n 8 MPI.exe	to execute
 
@@ -144,43 +144,46 @@ void rowDivBlockCycle(int blockSize)
 	int comm_sz;
 	int my_rank;
 	double start, finish, time;//计时变量
-	float(*matrix)[ROW] = NULL;//global matrix
-	float(*result)[ROW] = NULL;//结果矩阵，用于校验
-	float(*myMat)[ROW];//local matrix
-	float myDiv[ROW];//本地消元行
+	float(*matrix)[ROW] = NULL;
+	float(*checkMat)[ROW] = NULL;
 	MPI_Init(NULL, NULL);
 	MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
 	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 	//向量数据类型
 	int fullBlockAmt = ROW / (blockSize * comm_sz);
-	myMat = new float[(fullBlockAmt+1) * blockSize][ROW];
 	int fullKernelAmt = (ROW / blockSize) % comm_sz;//MID_VECTOR的rank
 	int leftRow = ROW % blockSize;//MID_VECTOR尾部长度
 	MPI_Datatype BIG_VECTOR, SMALL_VECTOR;
-	40(fullBlockAmt + 1, blockSize, blockSize * comm_sz, MPI_FLOAT, &BIG_VECTOR);
-	MPI_Type_vector(fullBlockAmt, blockSize, blockSize * comm_sz, MPI_FLOAT, &SMALL_VECTOR);
+	MPI_Type_vector(fullBlockAmt + 1, blockSize * ROW, blockSize * comm_sz * ROW, MPI_FLOAT, &BIG_VECTOR);
+	MPI_Type_vector(fullBlockAmt, blockSize * ROW, blockSize * comm_sz * ROW, MPI_FLOAT, &SMALL_VECTOR);
 	MPI_Type_commit(&BIG_VECTOR);
 	MPI_Type_commit(&SMALL_VECTOR);
+	matrix = new float[ROW][ROW];
 	if (my_rank == 0)
 	{
-		matrix = new float[ROW][ROW];
-		result = new float[ROW][ROW];
 		init(matrix);
+		checkMat = new float[ROW][ROW];
+		memcpy(checkMat, matrix, ROW * ROW * sizeof(float));
 		start = MPI_Wtime();
 		int dest;
 		for(dest = 1;dest<fullKernelAmt;dest++)//分发BIG_VECTOR
-			MPI_Send(matrix[dest*blockSize], 1, BIG_VECTOR, dest, 0, MPI_COMM_WORLD);
-		for (;dest <= comm_sz;dest++)//分发SMALL_VECTOR
+			MPI_Send(matrix[dest * blockSize], 1, BIG_VECTOR, dest, 0, MPI_COMM_WORLD);
+		for (;dest < comm_sz;dest++)//分发SMALL_VECTOR
 			MPI_Send(matrix[dest * blockSize], 1, SMALL_VECTOR, dest, 0, MPI_COMM_WORLD);
-		if (leftRow)
+		if (leftRow && fullKernelAmt)//有未满的块且分配到非0进程
 			MPI_Send(matrix[ROW - leftRow], leftRow * ROW, MPI_FLOAT, fullKernelAmt, 1, MPI_COMM_WORLD);
 		//for (row = 0;row + blockSize <= ROW;row += blockSize)
 			//row / (blockSize * comm_sz) * blockSize + row % blockSize
 		//MPI_Send(matrix[row], ROW * (ROW - row), MPI_FLOAT, (row / blockSize) % comm_sz, row, MPI_COMM_WORLD);
-	}	
+	}
 	else
 	{
-		MPI_
+		if (my_rank < fullKernelAmt)
+			MPI_Recv(matrix[my_rank * blockSize], 1, BIG_VECTOR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		else
+			MPI_Recv(matrix[my_rank * blockSize], 1, SMALL_VECTOR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		if (leftRow && my_rank == fullKernelAmt)
+			MPI_Recv(matrix[ROW - leftRow], leftRow * ROW, MPI_FLOAT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 		/*int row;
 		for (row = blockSize * comm_sz;row + blockSize <= ROW;row += blockSize * comm_sz)
 			MPI_Recv(myMat[row / (blockSize * comm_sz) * blockSize + row % blockSize], ROW * blockSize, MPI_FLOAT, 0, row, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
@@ -189,25 +192,32 @@ void rowDivBlockCycle(int blockSize)
 	}
 	for (int k = 0;k < ROW;k++)
 	{
-		float* curDiv;
-		int src = upper_bound(displs, displs + comm_sz + 1, k * ROW) - displs - 1;
+		int src = (k % (blockSize * comm_sz)) / blockSize;
 		if (src == my_rank)
 		{
-			curDiv = myMat[k - displs[my_rank] / ROW];
 			for (int j = k + 1;j < ROW;j++)
-				curDiv[j] /= curDiv[k];
-			curDiv[k] = 1.0;
+				matrix[k][j] /= matrix[k][k];
+			matrix[k][k] = 1.0;
 		}
-		else curDiv = myDiv;
-		MPI_Bcast(curDiv, ROW, MPI_FLOAT, src, MPI_COMM_WORLD);
-		for (int i = max(displs[my_rank] / ROW, k + 1) - displs[my_rank] / ROW;i < displs[my_rank + 1] / ROW - displs[my_rank] / ROW;i++)
+		MPI_Bcast(matrix[k], ROW, MPI_FLOAT, src, MPI_COMM_WORLD);
+		int block = k / (blockSize * comm_sz);
+		int i;
+		if (my_rank < src)
+			i = my_rank * blockSize + (blockSize * comm_sz) * (block + 1);
+		else if (my_rank == src) 
+		{
+			i = k + 1;
+			if(i % blockSize == 0) i += blockSize * (comm_sz - 1);
+		}
+		else i = my_rank * blockSize + (blockSize * comm_sz) * block;
+		while(i<ROW)
 		{
 			for (int j = k + 1;j < ROW;j++)
-				myMat[i][j] -= myMat[i][k] * curDiv[j];
-			myMat[i][k] = 0;
+				matrix[i][j] -= matrix[i][k] * matrix[k][j];
+			matrix[i][k] = 0;
+			if ((++i) % blockSize == 0) i += blockSize * (comm_sz - 1);//i++,若须换块则换块
 		}
 	}
-	MPI_Gatherv(myMat, sendCounts[my_rank], MPI_FLOAT, result, sendCounts, displs, MPI_FLOAT, 0, MPI_COMM_WORLD);
 	if (my_rank == 0)
 	{
 		finish = MPI_Wtime();
@@ -217,16 +227,16 @@ void rowDivBlockCycle(int blockSize)
 		double time = 0;
 		QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
 		QueryPerformanceCounter((LARGE_INTEGER*)&head);
-		plain(matrix);
+		plain(checkMat);
 		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 		time = (tail - head) * 1000.0 / freq;
 		std::cout << time << '\n';
-		check(matrix, result);
+		check(matrix, checkMat);
 	}
 	MPI_Finalize();
 }
 int main()
 {
-	rowDiv();
+	rowDivBlockCycle(3);
 	return 0;
 }
