@@ -73,8 +73,8 @@ void rowDiv()
 	int my_rank;
 	double start, finish, time;//计时变量
 	float(*matrix)[ROW] = NULL;//global matrix
-	float(*result)[ROW] = NULL;//结果矩阵，用于校验
-	float(*myMat)[ROW];//local matrix
+	float(*checkMat)[ROW] = NULL;
+	float(*myMat)[ROW] = NULL;//local matrix
 	float myDiv[ROW];//本地消元行
 	MPI_Init(NULL, NULL);
 	MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
@@ -91,15 +91,22 @@ void rowDiv()
 		pos += sendCounts[i];
 	}
 	displs[comm_sz] = pos;
-	myMat = new float[sendCounts[my_rank]][ROW];
+	myMat = new float[sendCounts[my_rank] / ROW][ROW];
 	if (my_rank == 0)
 	{
 		matrix = new float[ROW][ROW];
-		result = new float[ROW][ROW];
+		checkMat = new float[ROW][ROW];
 		init(matrix);
+		memcpy(checkMat, matrix, ROW * ROW * sizeof(float));
 		start = MPI_Wtime();
 	}
 	MPI_Scatterv(matrix, sendCounts, displs, MPI_FLOAT, myMat, sendCounts[my_rank], MPI_FLOAT, 0, MPI_COMM_WORLD);
+	//若使用gatherv，注释此块
+	if (my_rank == 0)
+	{
+		//delete myMat;
+		myMat = matrix;
+	}
 	for (int k = 0;k < ROW;k++)
 	{
 		float* curDiv;
@@ -111,6 +118,8 @@ void rowDiv()
 				curDiv[j] /= curDiv[k];
 			curDiv[k] = 1.0;
 		}
+		else if (my_rank == 0)//若使用gatherv，注释此块
+			curDiv = matrix[k];
 		else curDiv = myDiv;
 		MPI_Bcast(curDiv, ROW, MPI_FLOAT, src, MPI_COMM_WORLD);
 		for (int i = max(displs[my_rank] / ROW, k + 1) - displs[my_rank] / ROW;i < displs[my_rank + 1] / ROW - displs[my_rank] / ROW;i++)
@@ -120,7 +129,7 @@ void rowDiv()
 			myMat[i][k] = 0;
 		}
 	}
-	MPI_Gatherv(myMat, sendCounts[my_rank], MPI_FLOAT, result, sendCounts, displs, MPI_FLOAT, 0, MPI_COMM_WORLD);
+	//MPI_Gatherv(myMat, sendCounts[my_rank], MPI_FLOAT, matrix, sendCounts, displs, MPI_FLOAT, 0, MPI_COMM_WORLD);
 	if (my_rank == 0)
 	{
 		finish = MPI_Wtime();
@@ -130,11 +139,11 @@ void rowDiv()
 		double time = 0;
 		QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
 		QueryPerformanceCounter((LARGE_INTEGER*)&head);
-		plain(matrix);
+		plain(checkMat);
 		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 		time = (tail - head) * 1000.0 / freq;
 		std::cout << time << '\n';
-		check(matrix, result);
+		check(matrix, checkMat);
 	}
 	MPI_Finalize();
 }
@@ -235,8 +244,91 @@ void rowDivBlockCycle(int blockSize)
 	}
 	MPI_Finalize();
 }
+
+void pipeline()
+{
+	int comm_sz;
+	int my_rank;
+	double start, finish, time;//计时变量
+	float(*matrix)[ROW] = NULL;//global matrix
+	float(*checkMat)[ROW] = NULL;
+	float(*myMat)[ROW] = NULL;//local matrix
+	float myDiv[ROW];//本地消元行
+	MPI_Init(NULL, NULL);
+	MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
+	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+	//计算每个进程的工作量和偏移
+	int* sendCounts = new int[comm_sz];
+	int* displs = new int[comm_sz + 1];
+	int pos = 0;
+	fill(sendCounts, sendCounts + ROW % comm_sz, (int)ceil((float)ROW / comm_sz) * ROW);
+	fill(sendCounts + ROW % comm_sz, sendCounts + comm_sz, ROW / comm_sz * ROW);
+	for (int i = 0;i < comm_sz;i++)
+	{
+		displs[i] = pos;
+		pos += sendCounts[i];
+	}
+	displs[comm_sz] = pos;
+	myMat = new float[sendCounts[my_rank]/ROW][ROW];
+	if (my_rank == 0)
+	{
+		matrix = new float[ROW][ROW];
+		checkMat = new float[ROW][ROW];
+		init(matrix);
+		memcpy(checkMat, matrix, ROW * ROW * sizeof(float));
+		start = MPI_Wtime();
+	}
+	MPI_Scatterv(matrix, sendCounts, displs, MPI_FLOAT, myMat, sendCounts[my_rank], MPI_FLOAT, 0, MPI_COMM_WORLD);
+	for (int k = 0;k < displs[my_rank] / ROW;k++)
+	{
+		MPI_Recv(myDiv, ROW, MPI_FLOAT, my_rank - 1, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		if(my_rank!=comm_sz-1)
+			MPI_Send(myDiv, ROW, MPI_FLOAT, my_rank + 1, k, MPI_COMM_WORLD);
+		for (int i = 0; i < sendCounts[my_rank] / ROW;i++)
+		{
+			for (int j = k + 1;j < ROW;j++)
+				myMat[i][j] -= myMat[i][k] * myDiv[j];
+			myMat[i][k] = 0;
+		}
+	}
+	for (int k = displs[my_rank] / ROW; k < displs[my_rank + 1] / ROW;k++)
+	{
+		int myRow = k - displs[my_rank] / ROW;
+		for (int j = k + 1;j < ROW;j++)
+			myMat[myRow][j] /= myMat[myRow][k];
+		myMat[myRow][k] = 1.0;
+		if (my_rank != comm_sz - 1)
+			MPI_Send(myMat[myRow], ROW, MPI_FLOAT, my_rank + 1, k, MPI_COMM_WORLD);
+		for (int r = myRow + 1;r < sendCounts[my_rank] / ROW;r++)
+		{
+			for (int j = k + 1;j < ROW;j++)
+				myMat[r][j] -= myMat[r][k] * myMat[myRow][j];
+			myMat[r][k] = 0;
+		}
+	}
+	MPI_Gatherv(myMat, sendCounts[my_rank], MPI_FLOAT, matrix, sendCounts, displs, MPI_FLOAT, 0, MPI_COMM_WORLD);
+	if (my_rank == 0)
+	{
+		finish = MPI_Wtime();
+		cout << (finish - start) * 1000 << endl;
+		//串行比较部分
+		ll head, tail, freq;
+		double time = 0;
+		QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
+		QueryPerformanceCounter((LARGE_INTEGER*)&head);
+		plain(checkMat);
+		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+		time = (tail - head) * 1000.0 / freq;
+		std::cout << time << '\n';
+		check(matrix, checkMat);
+	}
+	MPI_Finalize();
+}
+
 int main()
 {
-	rowDivBlockCycle(3);
+	//rowDiv();
+	//rowDivBlockCycle(1);
+	pipeline();
 	return 0;
 }
