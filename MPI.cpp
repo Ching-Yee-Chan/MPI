@@ -3,11 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <windows.h>
+
+#include <xmmintrin.h> //SSE
+#include <emmintrin.h> //SSE2
+#include <pmmintrin.h> //SSE3
+#include <tmmintrin.h> //SSSE3
+#include <smmintrin.h> //SSE4.1
+#include <nmmintrin.h> //SSSE4.2
+#include <immintrin.h> //AVX
+#include <omp.h>
 using namespace std;
 typedef long long ll;
 
 #define ROW 1024
 #define INTERVAL 10000
+#define NUM_THREADS 5
 
 //use	mpiexec -n 8 MPI.exe	to execute
 
@@ -71,7 +81,7 @@ void rowDiv()
 {
 	int comm_sz;
 	int my_rank;
-	double start, finish, time;//计时变量
+	double start, finish;//计时变量
 	float(*matrix)[ROW] = NULL;//global matrix
 	float(*checkMat)[ROW] = NULL;
 	float(*myMat)[ROW] = NULL;//local matrix
@@ -152,7 +162,7 @@ void rowDivBlockCycle(int blockSize)
 {
 	int comm_sz;
 	int my_rank;
-	double start, finish, time;//计时变量
+	double start, finish;//计时变量
 	float(*matrix)[ROW] = NULL;
 	float(*checkMat)[ROW] = NULL;
 	MPI_Init(NULL, NULL);
@@ -249,7 +259,7 @@ void pipeline()
 {
 	int comm_sz;
 	int my_rank;
-	double start, finish, time;//计时变量
+	double start, finish;//计时变量
 	float(*matrix)[ROW] = NULL;//global matrix
 	float(*checkMat)[ROW] = NULL;
 	float(*myMat)[ROW] = NULL;//local matrix
@@ -325,10 +335,105 @@ void pipeline()
 	MPI_Finalize();
 }
 
+void comb()
+{
+	int comm_sz;
+	int my_rank;
+	double start, finish;//计时变量
+	float(*matrix)[ROW] = NULL;
+	float(*checkMat)[ROW] = NULL;
+	MPI_Init(NULL, NULL);
+	MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
+	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+	//向量数据类型
+	int fullBlockAmt = ROW / comm_sz;
+	int fullKernelAmt = ROW % comm_sz;//MID_VECTOR的rank
+	MPI_Datatype BIG_VECTOR, SMALL_VECTOR;
+	MPI_Type_vector(fullBlockAmt + 1, ROW, comm_sz * ROW, MPI_FLOAT, &BIG_VECTOR);
+	MPI_Type_vector(fullBlockAmt, ROW, comm_sz * ROW, MPI_FLOAT, &SMALL_VECTOR);
+	MPI_Type_commit(&BIG_VECTOR);
+	MPI_Type_commit(&SMALL_VECTOR);
+	matrix = new float[ROW][ROW];
+	if (my_rank == 0)
+	{
+		init(matrix);
+		checkMat = new float[ROW][ROW];
+		memcpy(checkMat, matrix, ROW * ROW * sizeof(float));
+		start = MPI_Wtime();
+		int dest;
+		for (dest = 1;dest < fullKernelAmt;dest++)//分发BIG_VECTOR
+			MPI_Send(matrix[dest], 1, BIG_VECTOR, dest, 0, MPI_COMM_WORLD);
+		for (;dest < comm_sz;dest++)//分发SMALL_VECTOR
+			MPI_Send(matrix[dest], 1, SMALL_VECTOR, dest, 0, MPI_COMM_WORLD);
+	}
+	else
+	{
+		if (my_rank < fullKernelAmt)
+			MPI_Recv(matrix[my_rank], 1, BIG_VECTOR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+		else
+			MPI_Recv(matrix[my_rank], 1, SMALL_VECTOR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	}
+	int i, j, k;
+	__m128 mult1, mult2, sub1;
+	#pragma omp parallel num_threads(NUM_THREADS), private(i, j, k, mult1, mult2, sub1), shared(matrix)
+	for (k = 0;k < ROW;k++)
+	{
+		int src = k %  comm_sz;
+		if (src == my_rank)
+		{
+			#pragma omp for
+			for (j = k + 1;j < ROW;j++)
+				matrix[k][j] /= matrix[k][k];
+			#pragma omp single
+			matrix[k][k] = 1.0;
+		}
+		#pragma omp single
+		MPI_Bcast(matrix[k], ROW, MPI_FLOAT, src, MPI_COMM_WORLD);
+		int block = k / comm_sz;
+		int start;
+		if (my_rank <= src)
+			start = my_rank + comm_sz * (block + 1);
+		else start = my_rank + comm_sz * block;
+		#pragma omp for
+		for(i = start;i<ROW;i+=comm_sz)
+		{
+			mult1 = _mm_load_ps1(&matrix[i][k]);
+			for (j = k + 1;j < ROW && ((ROW - j) & 3);++j)
+				matrix[i][j] = matrix[i][j] - matrix[i][k] * matrix[k][j];
+			for (;j < ROW;j += 4)
+			{
+				sub1 = _mm_loadu_ps(&matrix[i][j]);
+				mult2 = _mm_loadu_ps(&matrix[k][j]);
+				mult2 = _mm_mul_ps(mult1, mult2);
+				sub1 = _mm_sub_ps(sub1, mult2);
+				_mm_storeu_ps(&matrix[i][j], sub1);
+			}
+			matrix[i][k] = 0.0;
+		}
+	}
+	if (my_rank == 0)
+	{
+		finish = MPI_Wtime();
+		cout << (finish - start) * 1000 << endl;
+		//串行比较部分
+		ll head, tail, freq;
+		double time = 0;
+		QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
+		QueryPerformanceCounter((LARGE_INTEGER*)&head);
+		plain(checkMat);
+		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+		time = (tail - head) * 1000.0 / freq;
+		std::cout << time << '\n';
+		check(matrix, checkMat);
+	}
+	MPI_Finalize();
+}
+
 int main()
 {
 	//rowDiv();
 	//rowDivBlockCycle(1);
-	pipeline();
+	//pipeline();
+	comb();
 	return 0;
 }
