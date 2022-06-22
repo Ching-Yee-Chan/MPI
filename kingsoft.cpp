@@ -2,7 +2,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
-#include <windows.h>
+#include <cstring>
+#include <sys/time.h>
 
 #include <xmmintrin.h> //SSE
 #include <emmintrin.h> //SSE2
@@ -149,12 +150,13 @@ void rowDiv()
 			finish = MPI_Wtime();
 			rowDivTime += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
+			struct timespec sts, ets;
+			timespec_get(&sts, TIME_UTC);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
-			plainTime += (tail - head) * 1000.0 / freq;
+			timespec_get(&ets, TIME_UTC);
+			time_t dsec = ets.tv_sec-sts.tv_sec;
+			long dnsec = ets.tv_nsec-sts.tv_nsec;
+			plainTime += dsec * 1000.0 + dnsec / 1000000.0;
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -258,11 +260,7 @@ void rowDivBlockCycle(int blockSize)
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -343,12 +341,7 @@ void pipeline()
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			double time = 0;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -446,12 +439,7 @@ void comb()
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			double time = 0;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;

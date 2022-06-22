@@ -1,23 +1,17 @@
-﻿#include <mpi.h>
+#include <mpi.h>
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 #include <cmath>
-#include <windows.h>
-
-#include <xmmintrin.h> //SSE
-#include <emmintrin.h> //SSE2
-#include <pmmintrin.h> //SSE3
-#include <tmmintrin.h> //SSSE3
-#include <smmintrin.h> //SSE4.1
-#include <nmmintrin.h> //SSSE4.2
-#include <immintrin.h> //AVX
+#include <sys/time.h>
+#include <arm_neon.h>
 #include <omp.h>
 using namespace std;
 typedef long long ll;
 
 #define ROW 1024
 #define ROLL 5
-#define NUM_THREADS 5
+#define NUM_THREADS 8
 
 //use	mpiexec -n 8 MPI.exe	to execute
 
@@ -84,7 +78,7 @@ void rowDiv()
 	int count = 0;
 	double plainTime = 0;
 	double rowDivTime = 0;
-	for (int t = 0;t < 5;t++)
+	for (int t = 0;t < ROW;t++)
 	{
 		double start, finish;//计时变量
 		float(*matrix)[ROW] = NULL;//global matrix
@@ -149,12 +143,13 @@ void rowDiv()
 			finish = MPI_Wtime();
 			rowDivTime += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
+			struct timespec sts, ets;
+			timespec_get(&sts, TIME_UTC);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
-			plainTime += (tail - head) * 1000.0 / freq;
+			timespec_get(&ets, TIME_UTC);
+			time_t dsec = ets.tv_sec-sts.tv_sec;
+			long dnsec = ets.tv_nsec-sts.tv_nsec;
+			plainTime += dsec * 1000.0 + dnsec / 1000000.0;
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -170,7 +165,6 @@ void rowDiv()
 		cout << "行块划分" << rowDivTime / count << endl;
 	}
 }
-
 void rowDivBlockCycle(int blockSize)
 {
 	int comm_sz;
@@ -258,11 +252,7 @@ void rowDivBlockCycle(int blockSize)
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -273,13 +263,14 @@ void rowDivBlockCycle(int blockSize)
 		cout<<"循环块划分"<<blockSize<<"	"<<time / count << endl;
 }
 
+
 void pipeline()
 {
 	int comm_sz;
 	int my_rank;
 	int count = 0;
 	double time = 0;
-	for (int t = 0;t < 5;t++)
+	for (int t = 0;t < ROW;t++)
 	{
 		double start, finish;//计时变量
 		float(*matrix)[ROW] = NULL;//global matrix
@@ -343,12 +334,7 @@ void pipeline()
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			double time = 0;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
@@ -368,7 +354,7 @@ void comb()
 	int my_rank;
 	int count = 0;
 	double time = 0;
-	for (int t = 0;t < 5;t++)
+	for (int t = 0;t < ROW;t++)
 	{
 		double start, finish;//计时变量
 		float(*matrix)[ROW] = NULL;
@@ -404,7 +390,7 @@ void comb()
 				MPI_Recv(matrix[my_rank], 1, SMALL_VECTOR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 		}
 		int i, j, k;
-		__m128 mult1, mult2, sub1;
+		float32x4_t mult1, mult2, sub1;
 		#pragma omp parallel num_threads(NUM_THREADS), private(i, j, k, mult1, mult2, sub1), shared(matrix)
 		for (k = 0;k < ROW;k++)
 		{
@@ -427,16 +413,16 @@ void comb()
 			#pragma omp for
 			for (i = start;i < ROW;i += comm_sz)
 			{
-				mult1 = _mm_load_ps1(&matrix[i][k]);
+				mult1 = vld1q_dup_f32(&matrix[i][k]);
 				for (j = k + 1;j < ROW && ((ROW - j) & 3);++j)
 					matrix[i][j] = matrix[i][j] - matrix[i][k] * matrix[k][j];
 				for (;j < ROW;j += 4)
 				{
-					sub1 = _mm_loadu_ps(&matrix[i][j]);
-					mult2 = _mm_loadu_ps(&matrix[k][j]);
-					mult2 = _mm_mul_ps(mult1, mult2);
-					sub1 = _mm_sub_ps(sub1, mult2);
-					_mm_storeu_ps(&matrix[i][j], sub1);
+					sub1 = vld1q_f32(&matrix[i][j]);
+					mult2 = vld1q_f32(&matrix[k][j]);
+					mult2 = vmulq_f32(mult1, mult2);
+					sub1 = vsubq_f32(sub1, mult2);
+					vst1q_f32(&matrix[i][j], sub1);
 				}
 				matrix[i][k] = 0.0;
 			}
@@ -446,12 +432,7 @@ void comb()
 			finish = MPI_Wtime();
 			time += (finish - start) * 1000;
 			//串行比较部分
-			ll head, tail, freq;
-			double time = 0;
-			QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-			QueryPerformanceCounter((LARGE_INTEGER*)&head);
 			plain(checkMat);
-			QueryPerformanceCounter((LARGE_INTEGER*)&tail);
 			check(matrix, checkMat);
 			delete[] matrix;
 			delete[] checkMat;
